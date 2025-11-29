@@ -1,0 +1,1 @@
+This is a multi-agent RAG chatbot built with LangGraph and Astra DB. A router LLM decides whether a user query should go to a vector store RAG pipeline (using documents indexed into Astra) or to a Wikipedia tool. The whole flow and state are managed as a graph in LangGraph
