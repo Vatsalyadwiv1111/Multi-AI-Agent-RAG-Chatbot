@@ -85,13 +85,25 @@ llm = HuggingFaceEndpoint(
     max_new_tokens=512,
     do_sample=False,
     repetition_penalty=1.1,
-    stop_sequences=["\n\n", "User:", "---", "[[user"]
+    stop_sequences=["\n\n", "User:", "---", "[[user"],
+    huggingfacehub_api_token=_api_token,
 )
 
-chat_model = ChatHuggingFace(llm=llm)
+# Initialize ChatHuggingFace
+try:
+    if _api_token is None:
+        print("Warning: HuggingFace API Token is missing. Tools and Chat will fail.")
+    chat_model = ChatHuggingFace(llm=llm)
+except Exception as e:
+    print(f"Error initializing ChatHuggingFace: {e}")
+    # Fallback or re-raise if critical for startup logic
+    chat_model = None
 
 # Bind tools to the chat model
-llm_with_tools = chat_model.bind_tools(tools)
+if chat_model:
+    llm_with_tools = chat_model.bind_tools(tools)
+else:
+    llm_with_tools = None
 
 # Global vector store to avoid re-embedding on every turn (simple caching)
 # In a production app, this should be managed better (e.g., per session or persistent)
@@ -202,9 +214,15 @@ Your functionalities are categorized as follows:
 
 def chatbot(state: State):
     """The main chatbot node."""
+    if not llm_with_tools:
+        return {"messages": [SystemMessage(content="Error: Language Model not initialized. Please check your API Token.")]}
+        
     system_prompt = generate_system_prompt(state)
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
-    response = llm_with_tools.invoke(messages)
+    try:
+        response = llm_with_tools.invoke(messages)
+    except Exception as e:
+        return {"messages": [SystemMessage(content=f"Error invoking model: {str(e)}")]}
     return {"messages": [response]}
 
 # Build the graph
