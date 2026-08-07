@@ -3,20 +3,20 @@ from dotenv import load_dotenv
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
-from typing import Annotated, List, TypedDict
+from typing import Annotated, List, Literal, TypedDict
 
-# Load environment variables
-# Force loading from the same directory as this script
+# ---------------------------------------------------------------------------
+# Setup (unchanged from the original single-agent version)
+# ---------------------------------------------------------------------------
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
 
-# Verify API Key
-# API Key Handling
+
 def validate_api_key():
     """Validates and retrieves the Hugging Face API Token."""
     api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
@@ -28,55 +28,75 @@ def validate_api_key():
                 api_token = st.secrets["HUGGINGFACEHUB_API_TOKEN"]
             elif "HF_TOKEN" in st.secrets:
                 api_token = st.secrets["HF_TOKEN"]
-        except:
+        except Exception:
             pass
 
     if not api_token:
-        # Return None instead of raising immediately to allow UI to handle it
         return None
-    
+
     os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_token
     return api_token
 
-# Attempt verification on import, but don't hard crash yet
+
 _api_token = validate_api_key()
 
+
+def validate_langsmith_config():
+    """Enables LangSmith tracing if a key is present. Optional — the app
+    runs fine without it, you just won't get traces in the dashboard."""
+    api_key = os.getenv("LANGCHAIN_API_KEY")
+
+    if not api_key:
+        try:
+            import streamlit as st
+            if "LANGCHAIN_API_KEY" in st.secrets:
+                api_key = st.secrets["LANGCHAIN_API_KEY"]
+        except Exception:
+            pass
+
+    if not api_key:
+        print("LangSmith tracing disabled (no LANGCHAIN_API_KEY set).")
+        return False
+
+    os.environ["LANGCHAIN_API_KEY"] = api_key
+    os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
+    os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "multi-agent-rag-chatbot")
+    print(f"LangSmith tracing enabled (project: {os.environ['LANGCHAIN_PROJECT']}).")
+    return True
+
+
+_langsmith_enabled = validate_langsmith_config()
 
 # Import tools
 from tools.pdf_processor import load_pdf
 from tools.wiki_search import search_wikipedia
 from tools.url_retriever import retrieve_url_content
 
+
 class State(TypedDict):
     messages: Annotated[List, add_messages]
-    context_files: List[str] # List of file paths or identifiers
-    context_urls: List[str] # List of URLs
+    context_files: List[str]        # List of file paths or identifiers
+    context_urls: List[str]         # List of URLs
+    next: str                       # Which specialist the supervisor routed to
 
-# Define tools
-from langchain_core.tools import tool
 
-@tool
-def pdf_tool(file_path: str):
-    """Extracts text from a PDF file."""
-    return load_pdf(file_path)
-
+# Only the research agent needs a real bindable tool. The RAG agent gets its
+# context by retrieving from the vector store directly (see get_retriever),
+# same mechanism the original single agent used.
 @tool
 def wiki_tool(query: str):
     """Searches Wikipedia for a query."""
     return search_wikipedia(query)
 
-@tool
-def url_tool(url: str):
-    """Retrieves content from a URL."""
-    return retrieve_url_content(url)
 
-tools = [pdf_tool, wiki_tool, url_tool]
+research_tools = [wiki_tool]
 
-# Initialize LLM
-# Use Hugging Face Inference API
-# We use a model that supports tool calling or at least follows instructions well
-# Start with a reliable model on the free inference API
-# Zephyr 7B Beta is excellent for following instructions and chat
+# ---------------------------------------------------------------------------
+# LLM setup — one shared model instance used by all three agents.
+# (This is also the natural place to later swap in an LLM gateway like
+# LiteLLM: every agent calls `chat_model`, so the gateway only needs to be
+# wired in here, once.)
+# ---------------------------------------------------------------------------
 repo_id = "HuggingFaceH4/zephyr-7b-beta"
 
 llm = HuggingFaceEndpoint(
@@ -89,42 +109,35 @@ llm = HuggingFaceEndpoint(
     huggingfacehub_api_token=_api_token,
 )
 
-# Initialize ChatHuggingFace
 try:
     if _api_token is None:
-        print("Warning: HuggingFace API Token is missing. Tools and Chat will fail.")
+        print("Warning: HuggingFace API Token is missing. Agents will fail.")
     chat_model = ChatHuggingFace(llm=llm)
 except Exception as e:
     print(f"Error initializing ChatHuggingFace: {e}")
-    # Fallback or re-raise if critical for startup logic
     chat_model = None
 
-# Bind tools to the chat model
-if chat_model:
-    llm_with_tools = chat_model.bind_tools(tools)
-else:
-    llm_with_tools = None
+# Only the research agent gets tools bound to it
+research_llm = chat_model.bind_tools(research_tools) if chat_model else None
 
-# Global vector store to avoid re-embedding on every turn (simple caching)
-# In a production app, this should be managed better (e.g., per session or persistent)
+# ---------------------------------------------------------------------------
+# Shared RAG retriever (identical logic to before, now used only by rag_agent)
+# ---------------------------------------------------------------------------
 vector_store = None
 current_files_hash = ""
 
+
 def get_retriever(files, urls):
-    """
-    Creates or updates a vector store from the provided files and URLs.
-    """
+    """Creates or updates a vector store from the provided files and URLs."""
     global vector_store, current_files_hash
-    
-    # Simple hash to check if files changed (naive implementation)
+
     new_hash = str(sorted(files)) + str(sorted(urls))
-    
+
     if vector_store is not None and new_hash == current_files_hash:
         return vector_store.as_retriever(search_kwargs={"k": 3})
-    
+
     documents = []
-    
-    # Load PDFs
+
     if files:
         for file_path in files:
             try:
@@ -134,8 +147,7 @@ def get_retriever(files, urls):
                 documents.extend(docs)
             except Exception as e:
                 print(f"Error reading {file_path}: {e}")
-                
-    # Load URLs
+
     if urls:
         for url in urls:
             try:
@@ -145,125 +157,228 @@ def get_retriever(files, urls):
                 documents.extend(docs)
             except Exception as e:
                 print(f"Error reading {url}: {e}")
-    
+
     if not documents:
         return None
-        
-    # Split text
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(documents)
-    
-    # Create Vector Store
-    # Use a small, fast embedding model optimal for CPU
+
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     vector_store = FAISS.from_documents(splits, embeddings)
     current_files_hash = new_hash
-    
+
     return vector_store.as_retriever(search_kwargs={"k": 3})
 
-def generate_system_prompt(state: State):
-    """Generates a dynamic system prompt based on context retrieved via RAG."""
+
+def _get_user_query(state: State) -> str:
+    """Pulls the latest human message out of state, handling both message
+    object and dict-style history entries."""
+    messages = state.get("messages", [])
+    if not messages:
+        return ""
+    last_msg = messages[-1]
+    if isinstance(last_msg, HumanMessage):
+        return last_msg.content
+    if isinstance(last_msg, dict) and last_msg.get("role") == "user":
+        return last_msg.get("content", "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# SUPERVISOR — classifies the query and routes it to one specialist agent.
+# ---------------------------------------------------------------------------
+def supervisor(state: State):
+    """Decides whether the query goes to the RAG, research, or chat agent."""
     files = state.get("context_files", [])
     urls = state.get("context_urls", [])
-    messages = state.get("messages", [])
-    
-    # Get user query from the last message
-    user_query = ""
-    if messages:
-        last_msg = messages[-1]
-        if isinstance(last_msg, HumanMessage):
-            user_query = last_msg.content
-        elif isinstance(last_msg, dict) and last_msg.get("role") == "user":
-             user_query = last_msg.get("content", "")
-    
-    prompt = """You are a multi-model retrieval-augmented generation (RAG) chatbot capable of processing queries across various domains.
-Your functionalities are categorized as follows:
-1. **PDF Query Handling**: When a user asks a question related to a specific PDF document, retrieve relevant information from the PDF and provide a concise answer.
-2. **URL Query Handling**: If the question pertains to content from a specified set of URLs, access the relevant web document and return an accurate answer based on that source.
-3. **Wikipedia Queries**: For general knowledge questions, utilize Wikipedia or other reliable knowledge bases to provide accurate and succinct answers.
-4. **General LLM Responses**: When the query is conversational (jokes, stories, greetings) or open-ended, be **highly engaging, witty, and personable**. You are not a robot; show personality! Feel free to use humor, emojis, and creative storytelling.
-5. **Memory Functionality**: You have access to the conversation history. Reference past interactions to provide contextually relevant and personalized responses.
+    user_query = _get_user_query(state)
 
-**Instructions**:
-- **For General/Chat**: Be fun, creative, and entertaining. If asked for a joke or story, make it good!
-- **For RAG/Wiki**: Be strictly factual and concise. Do not invent information.
-- Prioritize responses based on the user's previous interactions.
-- If a question falls outside your knowledge base or context, clarify it politely.
+    # Fast-path: if the user has loaded documents/URLs, assume the question
+    # is about them — this mirrors the original app's always-inject-context
+    # behaviour and avoids an extra LLM call on every turn.
+    if files or urls:
+        return {"next": "rag_agent"}
 
-**Citation**:
-- When answering from PDFs or URLs, explicitly state the source at the end of your response (e.g., "Source: PDF - [filename]" or "Source: [URL]").
-"""
-    
-    prompt += "\n\n--- CONTEXT START ---\n"
-    
-    if user_query and (files or urls):
-        retriever = get_retriever(files, urls)
-        if retriever:
-            relevant_docs = retriever.invoke(user_query)
-            for doc in relevant_docs:
-                source = doc.metadata.get("source", "Unknown")
-                prompt += f"\n[Source: {source}]\n{doc.page_content}\n"
-        else:
-            prompt += "\nNo documents available to search.\n"
-    else:
-        prompt += "\nNo context available or no query provided to search.\n"
+    if not chat_model:
+        # No model available — route to chat_agent, which will surface a
+        # clear error message rather than crashing the graph.
+        return {"next": "chat_agent"}
 
-    prompt += "\n--- CONTEXT END ---\n"
-        
-    return prompt
+    classification_prompt = f"""Classify the user's message into exactly one category.
+Reply with only one word, nothing else.
 
-def chatbot(state: State):
-    """The main chatbot node."""
-    if not llm_with_tools:
-        return {"messages": [SystemMessage(content="Error: Language Model not initialized. Please check your API Token.")]}
-        
-    system_prompt = generate_system_prompt(state)
-    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+"wiki" -> factual or general-knowledge questions that need looking something up
+"chat" -> greetings, jokes, stories, opinions, or casual conversation
+
+Message: "{user_query}"
+Category:"""
+
     try:
-        response = llm_with_tools.invoke(messages)
+        decision = chat_model.invoke([SystemMessage(content=classification_prompt)])
+        label = str(decision.content).strip().lower()
     except Exception as e:
-        return {"messages": [SystemMessage(content=f"Error invoking model: {str(e)}")]}
+        print(f"Supervisor classification failed, defaulting to chat: {e}")
+        label = "chat"
+
+    next_agent = "research_agent" if "wiki" in label else "chat_agent"
+    return {"next": next_agent}
+
+
+def route_from_supervisor(state: State) -> Literal["rag_agent", "research_agent", "chat_agent"]:
+    return state.get("next", "chat_agent")
+
+
+# ---------------------------------------------------------------------------
+# RAG AGENT — answers from uploaded PDFs / URLs.
+# ---------------------------------------------------------------------------
+RAG_SYSTEM_PROMPT = """You are a document-retrieval specialist inside a multi-agent chatbot.
+Answer strictly using the retrieved context below. Do not invent information.
+If the answer isn't in the context, say so clearly.
+Always cite the source at the end, e.g. "Source: PDF - filename.pdf" or "Source: URL - https://...".
+"""
+
+
+def rag_agent(state: State):
+    if not chat_model:
+        return {"messages": [AIMessage(content="Error: Language Model not initialized. Please check your API Token.")]}
+
+    files = state.get("context_files", [])
+    urls = state.get("context_urls", [])
+    user_query = _get_user_query(state)
+
+    context_block = "\n\n--- CONTEXT START ---\n"
+    retriever = get_retriever(files, urls)
+    if retriever and user_query:
+        relevant_docs = retriever.invoke(user_query)
+        for doc in relevant_docs:
+            source = doc.metadata.get("source", "Unknown")
+            context_block += f"\n[Source: {source}]\n{doc.page_content}\n"
+    else:
+        context_block += "\nNo documents available to search.\n"
+    context_block += "\n--- CONTEXT END ---\n"
+
+    system_prompt = RAG_SYSTEM_PROMPT + context_block
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+
+    try:
+        response = chat_model.invoke(messages)
+    except Exception as e:
+        return {"messages": [AIMessage(content=f"Error invoking model: {str(e)}")]}
     return {"messages": [response]}
 
-# Build the graph
+
+# ---------------------------------------------------------------------------
+# RESEARCH AGENT — Wikipedia specialist, runs its own tool-call loop.
+# ---------------------------------------------------------------------------
+RESEARCH_SYSTEM_PROMPT = """You are a research specialist inside a multi-agent chatbot.
+Use the wiki_tool to look up facts on Wikipedia before answering general-knowledge questions.
+Be accurate and concise. Do not invent information."""
+
+
+def research_agent(state: State):
+    if not research_llm:
+        return {"messages": [AIMessage(content="Error: Language Model not initialized. Please check your API Token.")]}
+
+    messages = [SystemMessage(content=RESEARCH_SYSTEM_PROMPT)] + state["messages"]
+    try:
+        response = research_llm.invoke(messages)
+    except Exception as e:
+        return {"messages": [AIMessage(content=f"Error invoking model: {str(e)}")]}
+    return {"messages": [response]}
+
+
+# ---------------------------------------------------------------------------
+# CHAT AGENT — open-ended conversation, no tools.
+# ---------------------------------------------------------------------------
+CHAT_SYSTEM_PROMPT = """You are the conversational specialist inside a multi-agent chatbot.
+Be highly engaging, witty, and personable for jokes, stories, greetings, and open-ended chat.
+You are not a robot — show personality!"""
+
+
+def chat_agent(state: State):
+    if not chat_model:
+        return {"messages": [AIMessage(content="Error: Language Model not initialized. Please check your API Token.")]}
+
+    messages = [SystemMessage(content=CHAT_SYSTEM_PROMPT)] + state["messages"]
+    try:
+        response = chat_model.invoke(messages)
+    except Exception as e:
+        return {"messages": [AIMessage(content=f"Error invoking model: {str(e)}")]}
+    return {"messages": [response]}
+
+
+# ---------------------------------------------------------------------------
+# Build the graph:
+#   START -> supervisor -> { rag_agent | research_agent (+tools loop) | chat_agent } -> END
+# ---------------------------------------------------------------------------
 graph_builder = StateGraph(State)
 
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("tools", ToolNode(tools))
+graph_builder.add_node("supervisor", supervisor)
+graph_builder.add_node("rag_agent", rag_agent)
+graph_builder.add_node("research_agent", research_agent)
+graph_builder.add_node("research_tools", ToolNode(research_tools))
+graph_builder.add_node("chat_agent", chat_agent)
 
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_conditional_edges("chatbot", tools_condition)
-graph_builder.add_edge("tools", "chatbot")
+graph_builder.add_edge(START, "supervisor")
+graph_builder.add_conditional_edges(
+    "supervisor",
+    route_from_supervisor,
+    {"rag_agent": "rag_agent", "research_agent": "research_agent", "chat_agent": "chat_agent"},
+)
+
+# RAG and chat agents answer directly and finish
+graph_builder.add_edge("rag_agent", END)
+graph_builder.add_edge("chat_agent", END)
+
+# Research agent runs its own tool-call loop before finishing
+graph_builder.add_conditional_edges("research_agent", tools_condition, {"tools": "research_tools", END: END})
+graph_builder.add_edge("research_tools", "research_agent")
 
 graph = graph_builder.compile()
 
-# Example usage function
+
+# ---------------------------------------------------------------------------
+# Example usage function — SAME SIGNATURE as before, so app.py needs no changes.
+# ---------------------------------------------------------------------------
 def run_agent(input_text, files=None, urls=None, thread_id="1"):
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "run_name": "multi-agent-rag-chatbot",
+        "tags": ["multi-agent-rag-chatbot"],
+        "metadata": {
+            "thread_id": thread_id,
+            "has_files": bool(files),
+            "has_urls": bool(urls),
+        },
+    }
     initial_state = {
         "messages": [HumanMessage(content=input_text)],
         "context_files": files or [],
-        "context_urls": urls or []
+        "context_urls": urls or [],
+        "next": "",
     }
-    # For a simple run we can just invoke, but usually we want to stream or iterate
-    # This is a synchronous simple wrapper for the Streamlit app
+
     events = graph.stream(initial_state, config=config)
     final_response = ""
+    # The final answer can now come from any of three specialist nodes,
+    # so check all three instead of always reading from "chatbot".
     for event in events:
-        if "chatbot" in event:
-            message = event["chatbot"]["messages"][-1]
-            content = message.content
-            
-            # Handle list content (common with Gemini for multimodal/grounding)
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        text_parts.append(part["text"])
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                final_response = "".join(text_parts)
-            else:
-                final_response = str(content)
-                
+        for node_name in ("rag_agent", "research_agent", "chat_agent"):
+            if node_name in event:
+                message = event[node_name]["messages"][-1]
+                content = message.content
+
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and "text" in part:
+                            text_parts.append(part["text"])
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    if text_parts:
+                        final_response = "".join(text_parts)
+                elif content:
+                    final_response = str(content)
+
     return final_response
