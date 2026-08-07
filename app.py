@@ -1,14 +1,17 @@
 import streamlit as st
 import tempfile
 import os
+from dotenv import load_dotenv
+
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path, override=True)
 from agent import run_agent
 
 # Set page configuration
 st.set_page_config(page_title="Multimodal RAG Agent", layout="wide")
 
-# Check for API Key validity
-if not os.getenv("HUGGINGFACEHUB_API_TOKEN"):
-    # Try one more time to load secrets explicitly in main app flow
+token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+if not token or token == "your_hf_token_here":
     try:
         if "HUGGINGFACEHUB_API_TOKEN" in st.secrets:
             os.environ["HUGGINGFACEHUB_API_TOKEN"] = st.secrets["HUGGINGFACEHUB_API_TOKEN"]
@@ -17,9 +20,10 @@ if not os.getenv("HUGGINGFACEHUB_API_TOKEN"):
     except Exception:
         pass
 
-if not os.getenv("HUGGINGFACEHUB_API_TOKEN"):
-    st.error("🚨 API Token Missing! Please add `HUGGINGFACEHUB_API_TOKEN` to your Streamlit Secrets.")
-    st.info("Go to 'Manage app' > 'Settings' > 'Secrets' and add:\n\n`HUGGINGFACEHUB_API_TOKEN = 'your_hf_token'`")
+token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+if not token or token == "your_hf_token_here":
+    st.error("🚨 API Token Missing! Please add your real `HUGGINGFACEHUB_API_TOKEN` to your `.env` file or Streamlit Secrets.")
+    st.info("Edit `.env` in the root directory:\n\n`HUGGINGFACEHUB_API_TOKEN=hf_your_actual_token`\n\nGet a free token at [Hugging Face Settings](https://huggingface.co/settings/tokens).")
     st.stop()
 
 st.title("Multimodal RAG Agent")

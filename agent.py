@@ -14,14 +14,14 @@ from typing import Annotated, List, Literal, TypedDict
 # Setup (unchanged from the original single-agent version)
 # ---------------------------------------------------------------------------
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
-load_dotenv(dotenv_path)
+load_dotenv(dotenv_path, override=True)
 
 
 def validate_api_key():
     """Validates and retrieves the Hugging Face API Token."""
     api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-    if not api_token:
+    if not api_token or api_token == "your_hf_token_here":
         try:
             import streamlit as st
             if "HUGGINGFACEHUB_API_TOKEN" in st.secrets:
@@ -31,7 +31,7 @@ def validate_api_key():
         except Exception:
             pass
 
-    if not api_token:
+    if not api_token or api_token == "your_hf_token_here":
         return None
 
     os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_token
@@ -97,7 +97,7 @@ research_tools = [wiki_tool]
 # LiteLLM: every agent calls `chat_model`, so the gateway only needs to be
 # wired in here, once.)
 # ---------------------------------------------------------------------------
-repo_id = "HuggingFaceH4/zephyr-7b-beta"
+repo_id = "Qwen/Qwen2.5-72B-Instruct"
 
 llm = HuggingFaceEndpoint(
     repo_id=repo_id,
