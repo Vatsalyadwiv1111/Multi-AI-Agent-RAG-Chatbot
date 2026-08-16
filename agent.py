@@ -16,6 +16,9 @@ from typing import Annotated, List, Literal, TypedDict
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path, override=True)
 
+from monitoring import setup_telemetry
+setup_telemetry()
+
 
 def validate_api_key():
     """Validates and retrieves the Hugging Face API Token."""
@@ -92,29 +95,19 @@ def wiki_tool(query: str):
 research_tools = [wiki_tool]
 
 # ---------------------------------------------------------------------------
-# LLM setup — one shared model instance used by all three agents.
-# (This is also the natural place to later swap in an LLM gateway like
-# LiteLLM: every agent calls `chat_model`, so the gateway only needs to be
-# wired in here, once.)
 # ---------------------------------------------------------------------------
-repo_id = "Qwen/Qwen2.5-72B-Instruct"
-
-llm = HuggingFaceEndpoint(
-    repo_id=repo_id,
-    task="text-generation",
-    max_new_tokens=512,
-    do_sample=False,
-    repetition_penalty=1.1,
-    stop_sequences=["\n\n", "User:", "---", "[[user"],
-    huggingfacehub_api_token=_api_token,
-)
+# LLM Gateway Integration — Agents request model through LiteLLM Gateway
+# ---------------------------------------------------------------------------
+from gateway import get_gateway_llm
 
 try:
     if _api_token is None:
-        print("Warning: HuggingFace API Token is missing. Agents will fail.")
-    chat_model = ChatHuggingFace(llm=llm)
+        print("Warning: HuggingFace API Token is missing. Gateway will reject requests.")
+        chat_model = None
+    else:
+        chat_model = get_gateway_llm()
 except Exception as e:
-    print(f"Error initializing ChatHuggingFace: {e}")
+    print(f"Error initializing Gateway LLM: {e}")
     chat_model = None
 
 # Only the research agent gets tools bound to it
@@ -342,6 +335,19 @@ graph = graph_builder.compile()
 # Example usage function — SAME SIGNATURE as before, so app.py needs no changes.
 # ---------------------------------------------------------------------------
 def run_agent(input_text, files=None, urls=None, thread_id="1"):
+    import time
+    from guardrails import validate_input, validate_output
+    from evaluation import evaluate_agent_response
+
+    start_time = time.time()
+
+    # 1. Execute Input Guardrails Check
+    input_check = validate_input(input_text)
+    if not input_check.is_valid:
+        return f"🚨 Guardrail Alert ({input_check.violation_type}): {input_check.reason}"
+
+    sanitized_input = input_check.sanitized_text
+
     config = {
         "configurable": {"thread_id": thread_id},
         "run_name": "multi-agent-rag-chatbot",
@@ -353,7 +359,7 @@ def run_agent(input_text, files=None, urls=None, thread_id="1"):
         },
     }
     initial_state = {
-        "messages": [HumanMessage(content=input_text)],
+        "messages": [HumanMessage(content=sanitized_input)],
         "context_files": files or [],
         "context_urls": urls or [],
         "next": "",
@@ -361,8 +367,6 @@ def run_agent(input_text, files=None, urls=None, thread_id="1"):
 
     events = graph.stream(initial_state, config=config)
     final_response = ""
-    # The final answer can now come from any of three specialist nodes,
-    # so check all three instead of always reading from "chatbot".
     for event in events:
         for node_name in ("rag_agent", "research_agent", "chat_agent"):
             if node_name in event:
@@ -381,4 +385,17 @@ def run_agent(input_text, files=None, urls=None, thread_id="1"):
                 elif content:
                     final_response = str(content)
 
-    return final_response
+    # 2. Execute Output Guardrails Check
+    output_check = validate_output(final_response)
+    
+    # 3. Execute LLM Evaluation Layer
+    elapsed_seconds = time.time() - start_time
+    eval_result = evaluate_agent_response(
+        query=sanitized_input,
+        response=output_check.sanitized_text,
+        context_docs=[],
+        latency_seconds=elapsed_seconds
+    )
+    print(f"[EVALUATION] {eval_result.summary}")
+
+    return output_check.sanitized_text
